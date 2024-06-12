@@ -4,6 +4,7 @@
 #include <AccelStepper.h>
 #include <pins.h>
 #include <Parameters.h>
+#include <genieArduino.h>
 
 HX711 scaleX;
 HX711 scaleY;
@@ -13,6 +14,8 @@ TMC2130Stepper ydriver = TMC2130Stepper(Y_CS_PIN, R_SENSE, 13, 12, 14); // Softw
 
 AccelStepper stepperX = AccelStepper(stepperX.DRIVER, xSTEP_PIN, xDIR_PIN);
 AccelStepper stepperY = AccelStepper(stepperY.DRIVER, ySTEP_PIN, yDIR_PIN);
+
+Genie genie;
 
 static QueueHandle_t scaleX_queue;
 static QueueHandle_t scaleY_queue;
@@ -156,7 +159,6 @@ void TaskSteppers(void* pvParameters){
     // xdriver.en_pwm_mode(1);      // Enable extremely quiet stepping
     // xdriver.pwm_autoscale(1);
     // xdriver.microsteps(16);
-    //digitalWrite(X_CS_PIN, LOW);
     Serial.print("DRV_STATUS=0b");
 	  Serial.println(xdriver.DRV_STATUS(), BIN);
 
@@ -177,17 +179,81 @@ void TaskSteppers(void* pvParameters){
       stepperX.run();
       stepperY.run();
 
-      if (xdriver.stallguard()) {
-        Serial.println("Stall");
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-      }
+      // if (xdriver.stallguard()) {
+      //   Serial.println("Stall");
+      //   vTaskDelay(100 / portTICK_PERIOD_MS);
+      // }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
     }
     
 }
 static TaskHandle_t task_steppers= NULL;
 
-void TaskStateMachine(void* pvParameters){
+void myGenieEventHandler(void)
+{
+  genieFrame Event;
+  genie.DequeueEvent(&Event); // Remove the next queued event from the buffer, and process it below
+  //int slider_val = 0;
 
+  //If the cmd received is from a Reported Event (Events triggered from the Events tab of Workshop4 objects)
+  if (Event.reportObject.cmd == GENIE_REPORT_EVENT)
+  {
+    if (Event.reportObject.object == GENIE_OBJ_4DBUTTON)                // If the Reported Message was from a Slider
+    {
+      switch (Event.reportObject.index )
+      {
+      case 0:
+        //genie.WriteObject(GENIE_OBJ_SOUND,0,1);
+        Serial.println("Home");
+        break;
+      case 1:
+        Serial.println("Start");
+        break;
+      case 2:
+        Serial.println("Stop");
+        break;
+      default:
+        break;
+      }
+      }
+    }
+
+  //If the cmd received is from a Reported Object, which occurs if a Read Object (genie.ReadOject) is requested in the main code, reply processed here.
+  if (Event.reportObject.cmd == GENIE_REPORT_OBJ)
+  {
+    // if (Event.reportObject.object == GENIE_OBJ_USER_LED)              // If the Reported Message was from a User LED
+    // {
+    //   if (Event.reportObject.index == 0)                              // If UserLed0 (Index = 0)
+    //   {
+    //     bool UserLed0_val = genie.GetEventData(&Event);               // Receive the event data from the UserLed0
+    //     UserLed0_val = !UserLed0_val;                                 // Toggle the state of the User LED Variable
+    //     genie.WriteObject(GENIE_OBJ_USER_LED, 0, UserLed0_val);       // Write UserLed0_val value back to UserLed0
+    //   }
+    // }
+  }
+
+  /********** This can be expanded as more objects are added that need to be captured *************
+  *************************************************************************************************
+  Event.reportObject.cmd is used to determine the command of that event, such as an reported event
+  Event.reportObject.object is used to determine the object type, such as a Slider
+  Event.reportObject.index is used to determine the index of the object, such as Slider0
+  genie.GetEventData(&Event) us used to save the data from the Event, into a variable.
+  *************************************************************************************************/
+}
+
+void TaskStateMachine(void* pvParameters){
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  genie.Begin(Serial2);  //Software Serial
+  genie.WriteContrast(1); // About 2/3 Max Brightness
+  //genie.WriteStr(0, (String) "Hello 4D World");
+  genie.AttachEventHandler(myGenieEventHandler);
+
+  Serial.println("Main");
+
+  while(1){
+    genie.DoEvents();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
 static TaskHandle_t task_statemachine= NULL;
 
@@ -204,19 +270,19 @@ void setup() {
 
   // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
   xTaskCreatePinnedToCore(TaskSensors, "Sensors Readings", 2048, NULL, 2, &task_sensors, 0);
-  //vTaskSuspend(task_sensors);
+  vTaskSuspend(task_sensors);
   scaleX_queue = xQueueCreate(1, sizeof(int));
   scaleY_queue = xQueueCreate(1, sizeof(int));  
 
-  xTaskCreatePinnedToCore(TaskSteppers, "Stepper Motors", 2048, NULL, 2, &task_steppers, 1);
+  //xTaskCreatePinnedToCore(TaskSteppers, "Stepper Motors", 2048, NULL, 2, &task_steppers, 1);
   //vTaskSuspend(task_steppers);
   pos_X_queue = xQueueCreate(1, sizeof(int));
   pos_Y_queue = xQueueCreate(1, sizeof(int));  
 
-  //xTaskCreatePinnedToCore(TaskStateMachine, "Main Loop", 2048, NULL, 0, &task_statemachine, 1);
+  xTaskCreatePinnedToCore(TaskStateMachine, "Main Loop", 4096, NULL, 1, &task_statemachine, 1);
   //vTaskSuspend(task_statemachine)
 
-  //vTaskDelete(NULL); // Delete "setup and loop" task
+  vTaskDelete(NULL); // Delete "setup and loop" task
 
 }
 

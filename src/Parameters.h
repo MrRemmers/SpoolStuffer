@@ -14,4 +14,4 @@ const long yHome = 3500;   //4000;
 * HIGHEST     - 64    (Too sensitive = > False positive)
 * LOWEST        63    (Too insensitive = > No trigger)*/
 // 7 is great for 400 mA.       
-#define STALL_VALUE      7 //10 // [-64..63]    
+#define STALL_VALUE      20 //10 // [-64..63]    

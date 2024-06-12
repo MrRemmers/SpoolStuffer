@@ -1,8 +1,8 @@
 //Pins.h//
 #include <Arduino.h>
 
-#define RXD1       GPIO_NUM_16
-#define TXD1       GPIO_NUM_17
+#define RXD2       GPIO_NUM_16
+#define TXD2       GPIO_NUM_17
 
 #define dataPinX   33
 #define dataPinY   GPIO_NUM_25  //GPIO_NUM_25
