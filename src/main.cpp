@@ -7,7 +7,9 @@
 
 HX711 scaleX;
 HX711 scaleY;
-TMC2130Stepper xdriver(X_CS_PIN, R_SENSE); 
+//TMC2130Stepper xdriver(X_CS_PIN, R_SENSE, 0); 
+TMC2130Stepper xdriver = TMC2130Stepper(X_CS_PIN, R_SENSE, 13, 12, 14); // Software SPI 
+TMC2130Stepper ydriver = TMC2130Stepper(Y_CS_PIN, R_SENSE, 13, 12, 14); // Software SPI 
 
 AccelStepper stepperX = AccelStepper(stepperX.DRIVER, xSTEP_PIN, xDIR_PIN);
 AccelStepper stepperY = AccelStepper(stepperY.DRIVER, ySTEP_PIN, yDIR_PIN);
@@ -20,6 +22,7 @@ static QueueHandle_t pos_Y_queue;
 
 void TaskSensors(void* pvParameters);
 void TaskSteppers(void* pvParameters);
+void TaskStateMachine(void* pvParameters);
 
 void CalibrateScale(){
   scaleX.begin(dataPinX, clockPin, true);
@@ -94,7 +97,11 @@ void TaskSensors(void* pvParameters) {
 
     scaleX.begin(dataPinX, clockPin);                                   
     scaleX.set_offset(22008);
-    scaleX.set_scale(3325.150146);  //scale: 3317.347168
+    scaleX.set_scale(3325.150146);  
+
+    scaleY.begin(dataPinY, clockPin);                                   
+    scaleY.set_offset(22008);
+    scaleY.set_scale(3325.150146);  
 
     while (1) {
       if (scaleX.is_ready())
@@ -108,7 +115,9 @@ void TaskSensors(void* pvParameters) {
       if (scaleY.is_ready())
         {
           forceY = int(scaleY.get_units(1));
-          Serial.println(forceY);
+          xQueueReset(scaleY_queue);
+          xQueueSend(scaleY_queue, (void*)&forceY, 10);
+          //Serial.println(forceY);
           continue;
         }
 
@@ -119,21 +128,23 @@ static TaskHandle_t task_sensors= NULL;
 
 void TaskSteppers(void* pvParameters){
     (void)pvParameters;
-    SPI.begin();
-    pinMode(X_CS_PIN, OUTPUT);
-    digitalWrite(X_CS_PIN, HIGH);
+    pinMode(EN_PIN, OUTPUT);
+    pinMode(xSTEP_PIN, OUTPUT);
+    pinMode(xDIR_PIN, OUTPUT);
+    digitalWrite(EN_PIN, LOW);      // Enable driver in hardware
     xdriver.begin();             // Initiate pins and registeries
-    xdriver.tbl(1); //blank_time(24);  //number of clock cycles to wait for current sense. (16, 24, 36, 54)
+    ydriver.begin();
+    //xdriver.tbl(1); //blank_time(24);  //number of clock cycles to wait for current sense. (16, 24, 36, 54)
     //driver.freewheel(1);    //leads shorted.
     xdriver.rms_current(600);    // Set stepper current to 600mA. The command is the same as command TMC2130.setCurrent(600, 0.11, 0.5);
-    xdriver.ihold(1);            // 0to31 scale for holding current
-    xdriver.iholddelay(0);      //min delay before hold current applied 0...15
-    xdriver.TPOWERDOWN(255);     //max delay before powering down
-    xdriver.toff(4);     //? 0 no good, 1 no good, 2 works
-    //driver.en_pwm_mode(1);      // Enable extremely quiet stepping
+    //xdriver.ihold(1);            // 0to31 scale for holding current
+    //xdriver.iholddelay(0);      //min delay before hold current applied 0...15
+    //xdriver.TPOWERDOWN(255);     //max delay before powering down
+    //xdriver.toff(4);     //? 0 no good, 1 no good, 2 works
+    xdriver.en_pwm_mode(1);      // Enable extremely quiet stepping
     xdriver.pwm_autoscale(1);    //enable automatic PWM current control
-    xdriver.microsteps(2);   //0 means full step... (0,2,4,)
-    xdriver.TCOOLTHRS(0xFFFFF); // 20bit max  set to MAX because is disables stall guard.
+    xdriver.microsteps(16);   //0 means full step... (0,2,4,)
+    //xdriver.TCOOLTHRS(0xFFFFF); // 20bit max  set to MAX because is disables stall guard.
 
     xdriver.THIGH(0x0000F);    // 0 upper threshold for operation with stallguard
     xdriver.vhighchm(true);  //full stepping on high velocity commands
@@ -145,6 +156,9 @@ void TaskSteppers(void* pvParameters){
     // xdriver.en_pwm_mode(1);      // Enable extremely quiet stepping
     // xdriver.pwm_autoscale(1);
     // xdriver.microsteps(16);
+    //digitalWrite(X_CS_PIN, LOW);
+    Serial.print("DRV_STATUS=0b");
+	  Serial.println(xdriver.DRV_STATUS(), BIN);
 
     stepperX.setMaxSpeed(maxSpeed); 
     stepperX.setAcceleration(maxAccel); 
@@ -153,30 +167,34 @@ void TaskSteppers(void* pvParameters){
     stepperX.enableOutputs();
 
     stepperX.move(-xInsert);
-    do
-    {
-      stepperX.run();
-    } while (!xdriver.stallguard());
+    // do
+    // {
+    //   stepperX.run();
+    // } while (!xdriver.stallguard());
 
     while (1)
     {
       stepperX.run();
       stepperY.run();
+
+      if (xdriver.stallguard()) {
+        Serial.println("Stall");
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+      }
     }
     
 }
 static TaskHandle_t task_steppers= NULL;
 
+void TaskStateMachine(void* pvParameters){
+
+}
+static TaskHandle_t task_statemachine= NULL;
+
 void setup() {
 #pragma region PinSetup
   pinMode(valve_PIN, OUTPUT);
   digitalWrite(valve_PIN, LOW);
-
-  pinMode(EN_PIN, OUTPUT);
-  pinMode(xSTEP_PIN, OUTPUT);
-  pinMode(xDIR_PIN, OUTPUT);
-  digitalWrite(EN_PIN, LOW);      // Enable driver in hardware
-
 #pragma endregion 
 
   Serial.begin(115200);
@@ -186,14 +204,17 @@ void setup() {
 
   // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
   xTaskCreatePinnedToCore(TaskSensors, "Sensors Readings", 2048, NULL, 2, &task_sensors, 0);
-  //vTaskSuspend(task_sensors)
+  //vTaskSuspend(task_sensors);
   scaleX_queue = xQueueCreate(1, sizeof(int));
   scaleY_queue = xQueueCreate(1, sizeof(int));  
 
   xTaskCreatePinnedToCore(TaskSteppers, "Stepper Motors", 2048, NULL, 2, &task_steppers, 1);
-  //vTaskSuspend(task_steppers)
+  //vTaskSuspend(task_steppers);
   pos_X_queue = xQueueCreate(1, sizeof(int));
   pos_Y_queue = xQueueCreate(1, sizeof(int));  
+
+  //xTaskCreatePinnedToCore(TaskStateMachine, "Main Loop", 2048, NULL, 0, &task_statemachine, 1);
+  //vTaskSuspend(task_statemachine)
 
   //vTaskDelete(NULL); // Delete "setup and loop" task
 
