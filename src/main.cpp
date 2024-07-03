@@ -27,16 +27,75 @@ static QueueHandle_t pos_Y_queue;
 
 static QueueHandle_t state_queue;
 
+typedef enum
+{
+    e_NoError = 0,
+    e_UnknownError = 1,
+    e_ValveOpen = 2,
+    e_XForceLimit = 3,
+    e_AlreadyStarted = 4,
+    e_Num_ErrorCodes
+} Error_Codes_t;
+
+typedef enum
+{
+    e_Homeing = 0,
+    e_Start = 1,
+    e_Stabalize = 2,
+    e_Insert = 3,
+    e_Retract = 4,
+    e_Idle = 5,
+    e_XPlus = 6,
+    e_XMinus = 7,
+    e_YPlus = 8,
+    e_YMinus = 9,
+    e_Origin = 10,
+    e_Backup = 11,
+    e_Num_States
+} States_t;
+
+EventGroupHandle_t xEventGroupMain = xEventGroupCreate();
+EventGroupHandle_t xEventGroupManual = xEventGroupCreate();
+
+EventBits_t START_BIT = (1<<0);
+EventBits_t STOP_BIT = (1<<1);
+EventBits_t HOME_BIT = (1<<2);
+EventBits_t HOMED_BIT = (1<<3);
+EventBits_t RUNNING_BIT = (1<<4);
+EventBits_t YFORCE_BIT = (1<<5);
+EventBits_t VALVE_BIT = (1<<6);
+EventBits_t BACKUP_BIT = (1<<7);
+
+EventBits_t XJOGPLUS_BIT = (1<<0);
+EventBits_t XJOGMINUS_BIT = (1<<1);
+EventBits_t YJOGPLUS_BIT = (1<<2);
+EventBits_t YJOGMINUS_BIT = (1<<3);
+EventBits_t ORIGIN_BIT = (1<<4);
+EventBits_t XFORCE_BIT = (1<<5);
+
+
 static bool start_flag = false;
 static bool stop_flag = false;
 static bool home_flag = false;
 static bool homed_flag = false;
 static bool running = false;
 static bool yForce_Limit_Hit = false;
+static bool xJogPlus_flag = false;
+static bool xJogMinus_flag = false;
+static bool yJogPlus_flag = false;
+static bool yJogMinus_flag = false;
+static bool origin_flag = false;
+static bool valveState = false;
+
+static int JogSteps = stepspermm;
+static int JogMM = 0;
+static String JogStr = "";
 
 void TaskSensors(void* pvParameters);
 void TaskSteppers(void* pvParameters);
 void TaskStateMachine(void* pvParameters);
+void Jog_X(int steps);
+void Jog_Y(int steps);
 
 void CalibrateScale(){
   scaleX.begin(dataPinX, clockPin, true);
@@ -106,7 +165,7 @@ void TaskSensors(void* pvParameters) {
     (void)pvParameters;
     //static int step = 0;
     //float forceX, forceY;
-    int forceX, forceY;
+    int forceX, forceY, count;
     Serial.println("SCALE");
 
     scaleX.begin(dataPinX, clockPin);                                   
@@ -118,9 +177,12 @@ void TaskSensors(void* pvParameters) {
     scaleY.set_scale(3325.150146);  
 
     while (1) {
+      count++;
+      vTaskDelay(1 / portTICK_PERIOD_MS);
       if (scaleX.is_ready())
         {
           forceX = int(scaleX.get_units(1));
+          if (count >= force_refresh) genie.WriteObject(GENIE_OBJ_METER, 1, max(0, forceX * 100/2516));
           if (forceX > xForce_MAX)
           {
             
@@ -131,15 +193,15 @@ void TaskSensors(void* pvParameters) {
       if (scaleY.is_ready())
         {
           forceY = int(scaleY.get_units(1));
-          //Serial.println(forceY);
+          if (count >= force_refresh) genie.WriteObject(GENIE_OBJ_METER, 0, max(0, forceY) * 100/2516);
           if (forceY > yForce_MAX)
           {
-            yForce_Limit_Hit = true;
+            Serial.println("backup2");
+            xEventGroupSetBits(xEventGroupMain, YFORCE_BIT);
           }
           continue;
         }
-
-      vTaskDelay(2 / portTICK_PERIOD_MS);
+      if (count >= force_refresh) count = 0;
     }
 }
 static TaskHandle_t task_sensors= NULL;
@@ -152,10 +214,10 @@ void TaskSteppers(void* pvParameters){
     digitalWrite(EN_PIN, LOW);      // Enable driver in hardware
 
     xdriver.begin();             // Initiate pins and registeries
-    xdriver.rms_current(800);    // Set stepper current to 600mA. The command is the same as command TMC2130.setCurrent(600, 0.11, 0.5);
+    xdriver.rms_current(900);    // Set stepper current to 600mA. The command is the same as command TMC2130.setCurrent(600, 0.11, 0.5);
     xdriver.toff(4);     //? 0 no good, 1 no good, 2 works
     xdriver.blank_time(24);
-    xdriver.ihold(0);
+    xdriver.ihold(200);
     xdriver.dc_time(0);
     xdriver.dc_sg(0);
     xdriver.en_pwm_mode(1);      // Enable extremely quiet stepping
@@ -173,7 +235,7 @@ void TaskSteppers(void* pvParameters){
     ydriver.rms_current(900);    // Set stepper current to 600mA. The command is the same as command TMC2130.setCurrent(600, 0.11, 0.5);
     ydriver.toff(4);     //? 0 no good, 1 no good, 2 works
     ydriver.blank_time(24);
-    ydriver.ihold(0);
+    ydriver.ihold(200);
     ydriver.dc_time(0);
     ydriver.dc_sg(0);
     ydriver.en_pwm_mode(1);      // Enable extremely quiet stepping
@@ -205,31 +267,73 @@ void TaskSteppers(void* pvParameters){
     stepperY.setPinsInverted(false, false, true);
     stepperY.enableOutputs();
 
-    //stepperX.move(-xInsert);
-    // do
-    // {
-    //   stepperX.run();
-    // } while (!xdriver.stallguard());
-
     while (1)
     {
-      stepperX.run();
-      stepperY.run();
-      if (!running) vTaskDelay(1);
-
-      if (yForce_Limit_Hit)
+      /*if (xEventGroupGetBits(xEventGroupMain) & YFORCE_BIT)
       {
-        stepperY.setAcceleration(10000000);
-        yForce_Limit_Hit = false;
+        xEventGroupSetBits(xEventGroupMain, BACKUP_BIT);
+        stepperY.setAcceleration(100000);
+        //xEventGroupClearBits(xEventGroupMain, YFORCE_BIT);
         uint64_t tempYpos = stepperY.targetPosition();
-        stepperY.move(-5);
+        stepperY.move(1000);
+        //vTaskDelay(10 / portTICK_PERIOD_MS);
         stepperY.runToPosition();
-        stepperY.moveTo(tempYpos);
+        if (xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT) stepperY.moveTo(tempYpos);
         stepperY.setAcceleration(maxAccel);
       }
+      else
+      {
+        xEventGroupClearBits(xEventGroupMain, BACKUP_BIT);
+      }*/
+
+      stepperX.run();
+      stepperY.run();
+      if (!(xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT)) vTaskDelay(1);
     }
 }
 static TaskHandle_t task_steppers= NULL;
+
+void Jog_X(int steps)
+{
+  xEventGroupClearBits(xEventGroupManual, XJOGPLUS_BIT);//xJogPlus_flag = false;
+  xEventGroupClearBits(xEventGroupManual, XJOGMINUS_BIT);//xJogMinus_flag = false;
+  xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);//running = true;
+  stepperX.move(steps);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+  while(!xdriver.stst())
+  {
+    genie.DoEvents();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+
+    if (xEventGroupGetBits(xEventGroupMain) & STOP_BIT)
+    {
+      stepperX.stop();
+      stepperY.stop();
+    }
+  }
+  xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);//running = false;
+}
+
+void Jog_Y(int steps)
+{
+  xEventGroupClearBits(xEventGroupManual, YJOGPLUS_BIT);//yJogPlus_flag = false;
+  xEventGroupClearBits(xEventGroupManual, YJOGMINUS_BIT);//yJogMinus_flag = false;
+  xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);//running = true;
+  stepperY.move(steps);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+  while(!ydriver.stst() || (xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
+  {
+    genie.DoEvents();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+
+    if (xEventGroupGetBits(xEventGroupMain) & STOP_BIT)
+    {
+      stepperX.stop();
+      stepperY.stop();
+    }
+  }
+  xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);//running = false;
+}
 
 void myGenieEventHandler(void)
 {
@@ -247,16 +351,93 @@ void myGenieEventHandler(void)
         case 0:
           //genie.WriteObject(GENIE_OBJ_SOUND,0,1);
           Serial.println("Home");
-          home_flag = true;
+          xEventGroupSetBits(xEventGroupMain, HOME_BIT);//home_flag = true;
           break;
         case 1:
           Serial.println("Start");
-          start_flag = true;
+          xEventGroupSetBits(xEventGroupMain, START_BIT);//start_flag = true;
           break;
         case 2:
           Serial.println("Stop");
-          stop_flag = true;
+          xEventGroupSetBits(xEventGroupMain, STOP_BIT);//stop_flag = true;
           break;
+        case 4:
+          Serial.print("Valve ");
+          (xEventGroupGetBits(xEventGroupMain) & VALVE_BIT) ? xEventGroupClearBits(xEventGroupMain, VALVE_BIT) : xEventGroupSetBits(xEventGroupMain, VALVE_BIT);//valveState = !valveState;
+          digitalWrite(valve_PIN, (xEventGroupGetBits(xEventGroupMain) & VALVE_BIT));
+          Serial.println((xEventGroupGetBits(xEventGroupMain) & VALVE_BIT) ? "OPEN" : "CLOSED");
+        default:
+          break;
+      }
+    }
+
+    else if (Event.reportObject.object == GENIE_OBJ_WINBUTTON)
+    {
+      switch (Event.reportObject.index)
+      {
+        case 0:
+          Serial.print("JogX +");
+          Serial.println(JogSteps);
+          xEventGroupSetBits(xEventGroupManual, XJOGPLUS_BIT);//xJogPlus_flag = true;
+          break;
+        case 1:
+          Serial.print("JogX -");
+          Serial.println(JogSteps);
+          xEventGroupSetBits(xEventGroupManual, XJOGMINUS_BIT);//xJogMinus_flag = true;
+          break;
+        case 3:
+          Serial.print("JogY +");
+          Serial.println(JogSteps);
+          xEventGroupSetBits(xEventGroupManual, YJOGPLUS_BIT);//yJogPlus_flag = true;
+          break;
+        case 2:
+          Serial.print("JogY -");
+          Serial.println(JogSteps);
+          xEventGroupSetBits(xEventGroupManual, YJOGMINUS_BIT);//yJogMinus_flag = true;
+          break;
+        case 5:
+          Serial.println("Increase JogSteps");
+          JogSteps *= 10;
+          JogMM = JogSteps / stepspermm;
+          if (JogMM < 10) JogStr = "  " + (String)JogMM + " ";
+          else if (JogMM < 100) JogStr = " " + (String)JogMM + " ";
+          else if (JogMM < 1000) JogStr = " " + (String)JogMM;
+          else JogStr = (String)JogMM;
+          genie.WriteStr(1, JogStr);
+          break;
+        case 6:
+          Serial.println("Decrease JogSteps");
+          JogSteps /= 10;
+          if (JogSteps < 1) JogSteps = 1;
+          JogMM = JogSteps / stepspermm;
+          if (JogMM < 10) JogStr = "  " + (String)JogMM + " ";
+          else if (JogMM < 100) JogStr = " " + (String)JogMM + " ";
+          else if (JogMM < 1000) JogStr = " " + (String)JogMM;
+          else JogStr = (String)JogMM;
+          genie.WriteStr(1, JogStr);
+          break;
+        case 7:
+          Serial.println("Go to origin");
+          xEventGroupSetBits(xEventGroupManual, ORIGIN_BIT);//origin_flag = true;
+        default:
+          break;
+      }
+    }
+
+    else if (Event.reportObject.object == GENIE_OBJ_FORM)
+    {
+      Serial.println(Event.reportObject.index);
+      switch (Event.reportObject.index)
+      {
+        case 2:
+          JogMM = JogSteps / stepspermm;
+          if (JogMM < 10) JogStr = "  " + (String)JogMM + " ";
+          else if (JogMM < 100) JogStr = " " + (String)JogMM + " ";
+          else if (JogMM < 1000) JogStr = " " + (String)JogMM;
+          else JogStr = (String)JogMM;
+          genie.WriteStr(1, JogStr);
+          break;
+        
         default:
           break;
       }
@@ -288,10 +469,14 @@ void myGenieEventHandler(void)
 
 void HomeSteppers()
 {
+  if (xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT) return;
   uint8_t xStall = 0;
   uint8_t yStall = 0;
-  running = true;
-  home_flag = false;
+  int forceX, forceY;
+  int temphome = xEventGroupGetBits(xEventGroupMain) & HOME_BIT;
+  xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+  xEventGroupSetBits(xEventGroupMain, HOMED_BIT);
+  xEventGroupClearBits(xEventGroupMain, HOME_BIT);
   stepperX.setMaxSpeed(homeSpeed);
   stepperY.setMaxSpeed(homeSpeed);
   stepperX.move(xHome);
@@ -302,27 +487,34 @@ void HomeSteppers()
     genie.DoEvents();
     vTaskDelay(1 / portTICK_PERIOD_MS);
 
-    //AUTO HOME TESTING
-    if (!xdriver.ola()) xStall++;
+    if (!xdriver.olb() && !xdriver.ola()) xStall++;
     else xStall = 0;
 
-    if (!ydriver.ola()) yStall++;
+    if (!ydriver.olb() && !ydriver.ola()) yStall++;
     else yStall = 0;
 
-    if (xStall >= xHomeSense) stepperX.stop();
-    if (yStall >= yHomeSense) stepperY.stop();
+    Serial.println(xdriver.stallguard());
 
-    if (stop_flag or home_flag)
+    //if (xStall >= xHomeSense) stepperX.stop();
+    //if (yStall >= yHomeSense) stepperY.stop();
+
+    if ((xEventGroupGetBits(xEventGroupMain) & STOP_BIT) || (xEventGroupGetBits(xEventGroupMain) & HOME_BIT))
     {
       stepperX.stop();
       stepperY.stop();
-      break;
     }
+
+    //Read sensors and update graph
+    forceX = int(scaleX.get_units(1));
+    forceY = int(scaleY.get_units(1));
+
+    genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceX * 100/2516));
+    genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceY * 100/2516));
   }
   stepperX.setCurrentPosition(0);
   stepperY.setCurrentPosition(0);
-  home_flag = false;
-  homed_flag = !stop_flag;
+  //xEventGroupClearBits(xEventGroupMain, HOME_BIT);//home_flag = false;
+  (xEventGroupGetBits(xEventGroupMain) & STOP_BIT) ? xEventGroupClearBits(xEventGroupMain, HOMED_BIT) : xEventGroupSetBits(xEventGroupMain, HOMED_BIT);//homed_flag = !stop_flag;
   stepperX.setMaxSpeed(maxSpeed);
   stepperY.setMaxSpeed(maxSpeed);
   stepperX.moveTo(xStartPos);
@@ -332,69 +524,229 @@ void HomeSteppers()
   while(!(xdriver.stst() && ydriver.stst()))
   {
     genie.DoEvents();
-    //vTaskDelay(1 / portTICK_PERIOD_MS);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
 
-    if (stop_flag)
+    if (xEventGroupGetBits(xEventGroupMain) & STOP_BIT)
     {
       stepperX.stop();
       stepperY.stop();
-      break;
+    }
+
+    //Read sensors and update graph
+    forceX = int(scaleX.get_units(1));
+    forceY = int(scaleY.get_units(1));
+
+    genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceX * 100/2516));
+    genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceY * 100/2516));
+  }
+  if (temphome) xEventGroupSetBits(xEventGroupMain, HOME_BIT);
+  else xEventGroupClearBits(xEventGroupMain, HOME_BIT);
+  Serial.println("Done");
+  xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);//running = false;
+}
+
+void GoTo_Origin()
+{
+  xEventGroupClearBits(xEventGroupManual, ORIGIN_BIT);//origin_flag = false;
+  xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);//running = true;
+  stepperX.moveTo(xStartPos);
+  stepperY.moveTo(yStartPos);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+  while(!(ydriver.stst() && xdriver.stst()) || (xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
+  {
+    genie.DoEvents();
+
+    if (xEventGroupGetBits(xEventGroupMain) & STOP_BIT)
+    {
+      stepperX.stop();
+      stepperY.stop();
     }
   }
-  Serial.println("Done");
-  running = false;
+  xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);//running = false;
 }
+
+
 
 void TaskStateMachine(void* pvParameters){
     (void)pvParameters;
-    uint32_t state = 5;
+    States_t state = e_Idle;
+    States_t temp_state = e_Idle;
     bool startMove = true;
+    bool setup_backup = true;
+    uint64_t tempYpos = 0;
+
+    Error_Codes_t active_error = e_NoError;
+    bool setup_error = false;
+    String errorstr = "";
+
+    int forceX = 0;
+    int forceY = 0;
+    Serial.println("SCALE");
+
+    scaleX.begin(dataPinX, clockPin);                                   
+    scaleX.set_offset(22008);
+    scaleX.set_scale(3325.150146);  
+
+    scaleY.begin(dataPinY, clockPin);                                   
+    scaleY.set_offset(22008);
+    scaleY.set_scale(3325.150146);
+
+    vTaskDelay(2500 / portTICK_PERIOD_MS);
 
     Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
     genie.Begin(Serial2);  //Software Serial
     genie.WriteContrast(1); // About 2/3 Max Brightness
-    //genie.WriteStr(0, (String) "Hello 4D World");
     genie.AttachEventHandler(myGenieEventHandler);
+    JogMM = JogSteps / stepspermm;
+    if (JogMM < 10) JogStr = "  " + (String)JogMM + " ";
+    else if (JogMM < 100) JogStr = " " + (String)JogMM + " ";
+    else if (JogMM < 1000) JogStr = " " + (String)JogMM;
+    else JogStr = (String)JogMM;
+    Serial.println("JOG:" + JogStr);
+    genie.WriteStr(1, JogStr);
 
     Serial.println("Main");
 
     while (1)
     {
-      genie.DoEvents();
+      //Handle Sensor Readings
+      forceX = int(scaleX.get_units(1));
+       if (forceX > xForce_MAX)
+       {
+          xEventGroupSetBits(xEventGroupManual, XFORCE_BIT);
+       }
 
-      //Check if home button pressed
-      if (home_flag && !running)
+       forceY = int(scaleY.get_units(1));
+       if (forceY > yForce_MAX)
+       {
+          xEventGroupSetBits(xEventGroupMain, YFORCE_BIT);
+       }
+
+       else xEventGroupClearBits(xEventGroupMain, YFORCE_BIT);
+      
+
+      genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceX * 100/2516));
+      genie.WriteObject(GENIE_OBJ_SCOPE, 2, max(0, forceY * 100/2516));
+      
+      //Handle Genie Events
+      genie.DoEvents();
+      vTaskDelay(1);  //  / portTICK_PERIOD_MS
+
+      //Check for X force limit reached
+      if ((xEventGroupGetBits(xEventGroupManual) & XFORCE_BIT))
       {
-        HomeSteppers();
+        xEventGroupClearBits(xEventGroupManual, XFORCE_BIT);
+        xEventGroupClearBits(xEventGroupMain, BACKUP_BIT);
+        if (xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT)
+        {
+          stepperX.moveTo(0);
+          stepperY.moveTo(0);
+          //while(!(xdriver.stst() && ydriver.stst())) vTaskDelay(1 / portTICK_PERIOD_MS);
+          startMove = true;
+          state = e_Idle;
+          active_error = e_XForceLimit;
+        }
+      }
+
+      //Check for Y limit reached
+      if ((xEventGroupGetBits(xEventGroupMain) & YFORCE_BIT) && (xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT) && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))  // 
+      {
+        temp_state = state;
+        state = e_Backup;
+        setup_backup = true;
+      }
+
+      //Check for button presses if not running
+      if (!(xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT))
+      {
+        if (xEventGroupGetBits(xEventGroupMain) & HOME_BIT) state = e_Homeing;//HomeSteppers();
+        else if ((xEventGroupGetBits(xEventGroupManual) & XJOGPLUS_BIT) && state == e_Idle) state = e_XPlus;
+        else if ((xEventGroupGetBits(xEventGroupManual) & XJOGMINUS_BIT) && state == e_Idle) state = e_XMinus;
+        else if ((xEventGroupGetBits(xEventGroupManual) & YJOGPLUS_BIT) && state == e_Idle) state = e_YPlus;
+        else if ((xEventGroupGetBits(xEventGroupManual) & YJOGMINUS_BIT) && state == e_Idle) state = e_YMinus;
+        else if ((xEventGroupGetBits(xEventGroupManual) & ORIGIN_BIT) && state == e_Idle) GoTo_Origin();
+      }
+
+      //Check for button presses while running
+      else
+      {
+        if ((xEventGroupGetBits(xEventGroupMain) & START_BIT)) active_error = e_AlreadyStarted;
+      }
+
+      //Check for errors
+      if (active_error != e_NoError)
+      {
+        //generate error message
+        switch (active_error)
+        {
+          case e_UnknownError:
+            errorstr = "\nAn Unknown Error Occured\n\nSomething went wrong...";
+            break;
+
+          case e_ValveOpen:
+            errorstr = "\nClamp is not engaged\n\nEngage the clamp before starting.";
+            break;
+
+          case e_XForceLimit:
+            errorstr = "\nX force limit reached\n\nToo much force on X load sensor.";
+            break;
+
+          case e_AlreadyStarted:
+            errorstr = "\nProcedure is running\n\nWait until the procedure is done.";
+            xEventGroupClearBits(xEventGroupMain, START_BIT);
+            break;
+
+          default:
+            errorstr = "If you see this something is wrong";
+            break;
+        }
+
+        Serial.println(errorstr);
+
+        genie.WriteObject(GENIE_OBJ_FORM, 4, 1);
+        genie.WriteStr(0, errorstr);
+        active_error = e_NoError;
       }
 
       //Check if stop button pressed
-      if (stop_flag)
+      if (xEventGroupGetBits(xEventGroupMain) & STOP_BIT)
       {
+        stepperX.setAcceleration(maxAccel * 4);
+        stepperY.setAcceleration(maxAccel * 4);
         stepperX.stop();
         stepperY.stop();
+        while(!(xdriver.stst() && ydriver.stst())) vTaskDelay(1 / portTICK_PERIOD_MS);
+        stepperX.setAcceleration(maxAccel);
+        stepperY.setAcceleration(maxAccel);
         startMove = true;
-        state = 5;
+        state = e_Idle;
       }
 
       //State Machine
       switch (state)
       {
 
-        case 0:                                                   //Homing
-            if (startMove && !homed_flag)
+        case e_Homeing:                                                //Homing
+            Serial.print("state: ");
+            Serial.println(state);
+            Serial.println(startMove);
+            Serial.println(xEventGroupGetBits(xEventGroupMain) & HOMED_BIT);
+            Serial.println(xEventGroupGetBits(xEventGroupMain) & HOME_BIT);
+            if (startMove && (!(xEventGroupGetBits(xEventGroupMain) & HOMED_BIT)) || (xEventGroupGetBits(xEventGroupMain) & HOME_BIT))
             {
+              Serial.println("Homing...");
               HomeSteppers();
             }
-            state = 1;
+            state = (xEventGroupGetBits(xEventGroupMain) & HOME_BIT) ? e_Idle : e_Start;
+            xEventGroupClearBits(xEventGroupMain, HOME_BIT);
             startMove = true;
             break;
 
 
-        case 1:                                                   //Go to start position
+        case e_Start:                                                   //Go to start position
             if (startMove)
             {
-              running = true;
+              xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);//running = true;
               Serial.print("state: ");
               Serial.println(state);
               startMove = false;
@@ -402,15 +754,26 @@ void TaskStateMachine(void* pvParameters){
               stepperX.moveTo(xStartPos);
               vTaskDelay(100 / portTICK_PERIOD_MS);
             }
-            else if (xdriver.stst() && ydriver.stst())
+            else if (xdriver.stst() && ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
             {
-              state = 2;
-              startMove = true;
+              if (xEventGroupGetBits(xEventGroupMain) & VALVE_BIT)
+              {
+                state = e_Stabalize;
+                startMove = true;
+              }
+
+              else
+              {
+                state = e_Idle;
+                active_error = e_ValveOpen;
+                startMove = true;
+              }
+              
             }
             break;
 
 
-        case 2:                                                    //Insert X
+        case e_Stabalize:                                                    //Insert X
             if (startMove)
             {
               Serial.print("state: ");
@@ -421,32 +784,34 @@ void TaskStateMachine(void* pvParameters){
             }
             else if (xdriver.stst())
             {
-              state = 3;
+              state = e_Insert;
               startMove = true;
             }
             break;
 
 
-        case 3:                                                   //Retract X and Insert Y
+        case e_Insert:                                                   //Retract X and Insert Y
             if (startMove)
             {
+              stepperY.setAcceleration(maxAccel);
+              stepperX.setAcceleration(maxAccel);
               Serial.print("state: ");
               Serial.println(state);
               startMove = false;
               stepperY.moveTo(yInsert);
-              vTaskDelay(500 / portTICK_PERIOD_MS);
+              vTaskDelay((20000000 / maxSpeed) / portTICK_PERIOD_MS);
               stepperX.moveTo(xStartPos);
               vTaskDelay(100 / portTICK_PERIOD_MS);
             }
-            else if (xdriver.stst() && ydriver.stst())
+            else if (xdriver.stst() && ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
             {
-              state = 4;
+              state = e_Retract;
               startMove = true;
             }
             break;
 
 
-        case 4:                                                     //Retract Y (Go To Home)
+        case e_Retract:                                                     //Retract Y (Go To Home)
             if (startMove)
             {
               Serial.print("state: ");
@@ -455,34 +820,139 @@ void TaskStateMachine(void* pvParameters){
               stepperY.moveTo(yStartPos);
               vTaskDelay(100 / portTICK_PERIOD_MS);
             }
-            else if (ydriver.stst())
+            else if (ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
             {
-              
-              state = 5;
+              state = e_Idle;
               startMove = true;
             }
             break;
 
 
-        case 5:                                                     //Wait for button press and reset button states
+        case e_Idle:                                                     //Reset button states and wait for button press
             if (startMove)
             {
               Serial.print("state: ");
               Serial.println(state);
               startMove = false;
-              start_flag = false;
-              home_flag = false;
-              stop_flag = false;
-              running = false;
+              xEventGroupClearBits(xEventGroupMain, (START_BIT + HOME_BIT + STOP_BIT));
+              xEventGroupClearBits(xEventGroupManual, (XJOGMINUS_BIT + XJOGPLUS_BIT + YJOGMINUS_BIT + YJOGPLUS_BIT));
             }
-            if (start_flag)
+            if (xdriver.stst() && ydriver.stst()) xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+            if (xEventGroupGetBits(xEventGroupMain) & START_BIT)
             {
-              vTaskDelay(1000 / portTICK_PERIOD_MS);
-              start_flag = false;
-              state = 0;
+              vTaskDelay(100 / portTICK_PERIOD_MS);
+              xEventGroupClearBits(xEventGroupMain, START_BIT);//start_flag = false;
+              state = e_Homeing;
               startMove = true;
             }
             break;
+
+        case e_XPlus:
+            if (startMove)
+            {
+              xEventGroupClearBits(xEventGroupManual, XJOGPLUS_BIT);
+              xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+              startMove = false;
+              stepperX.move(JogSteps);
+              vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+            else if(xdriver.stst())
+            {
+              state = e_Idle;
+              startMove = true;
+              xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+            }
+            break;
+        
+        case e_XMinus:
+        if (startMove)
+            {
+              xEventGroupClearBits(xEventGroupManual, XJOGMINUS_BIT);
+              xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+              startMove = false;
+              stepperX.move(-JogSteps);
+              vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+            else if(xdriver.stst())
+            {
+              state = e_Idle;
+              startMove = true;
+              xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+            }
+            break;
+
+        case e_YPlus:
+            if (startMove)
+            {
+              xEventGroupClearBits(xEventGroupManual, YJOGPLUS_BIT);
+              xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+              startMove = false;
+              stepperY.move(JogSteps);
+              vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+            else if(ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
+            {
+              state = e_Idle;
+              startMove = true;
+              xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+            }
+            break;
+
+        case e_YMinus:
+            if (startMove)
+            {
+              xEventGroupClearBits(xEventGroupManual, YJOGMINUS_BIT);
+              xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+              startMove = false;
+              stepperY.move(-JogSteps);
+              vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+            else if(ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
+            {
+              state = e_Idle;
+              startMove = true;
+              xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+            }
+            break;
+
+        case e_Origin:
+          if (startMove)
+          {
+            xEventGroupClearBits(xEventGroupManual, ORIGIN_BIT);
+            xEventGroupSetBits(xEventGroupMain, RUNNING_BIT);
+            stepperX.moveTo(xStartPos);
+            stepperY.moveTo(yStartPos);
+            startMove = false;
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+          }
+          else if (xdriver.stst() && ydriver.stst() && !(xEventGroupGetBits(xEventGroupMain) & BACKUP_BIT))
+          {
+            state = e_Idle;
+            startMove = true;
+            xEventGroupClearBits(xEventGroupMain, RUNNING_BIT);
+          }
+
+        case e_Backup:
+            if (setup_backup)
+            {
+              setup_backup = false;
+              xEventGroupSetBits(xEventGroupMain, BACKUP_BIT);
+              stepperY.setAcceleration(100000);
+              tempYpos = stepperY.targetPosition();
+              stepperY.move(200);
+              vTaskDelay(1 / portTICK_PERIOD_MS);
+            }
+
+            else if (ydriver.stst())
+            {
+              if (xEventGroupGetBits(xEventGroupMain) & RUNNING_BIT) stepperY.moveTo(tempYpos);
+              stepperY.setAcceleration(maxAccel);
+              xEventGroupClearBits(xEventGroupMain, BACKUP_BIT);
+              state = temp_state;
+            }
+            break;
+
+
       }
     }
 }
@@ -500,17 +970,17 @@ void setup() {
   //Serial1.begin(9600, SERIAL_8N1, RXD1, TXD1);
 
   // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
-  xTaskCreatePinnedToCore(TaskSensors, "Sensors Readings", 2048, NULL, 2, &task_sensors, 0);
+  //xTaskCreatePinnedToCore(TaskSensors, "Sensors Readings", 2048, NULL, 3, &task_sensors, 1);
   //vTaskSuspend(task_sensors);
   scaleX_queue = xQueueCreate(1, sizeof(int));
   scaleY_queue = xQueueCreate(1, sizeof(int));  
 
-  xTaskCreatePinnedToCore(TaskSteppers, "Stepper Motors", 2048, NULL, 0, &task_steppers, 0);
+  xTaskCreatePinnedToCore(TaskSteppers, "Stepper Motors", 2048, NULL, 3, &task_steppers, 1);
   //vTaskSuspend(task_steppers);
   pos_X_queue = xQueueCreate(1, sizeof(int));
   pos_Y_queue = xQueueCreate(1, sizeof(int));  
 
-  xTaskCreatePinnedToCore(TaskStateMachine, "State Machine", 2048, NULL, 2, &task_statemachine, 1);
+  xTaskCreatePinnedToCore(TaskStateMachine, "State Machine", 2048, NULL, 3, &task_statemachine, 0);
   //vTaskSuspend(task_sensors);
   state_queue = xQueueCreate(1, sizeof(int));
 
